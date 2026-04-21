@@ -9,7 +9,7 @@ import subprocess
 import sys
 import zipfile
 import tempfile
-from dartvm_fetch_build import DartLibInfo
+from dartvm_fetch_build import DartLibInfo, version_tuple
 
 CMAKE_CMD = "cmake"
 NINJA_CMD = "ninja"
@@ -22,15 +22,17 @@ BUILD_DIR = os.path.join(SCRIPT_DIR, 'build')
 
 
 class BlutterInput:
-    def __init__(self, libapp_path: str, dart_info: DartLibInfo, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+    def __init__(self, libapp_path: str, dart_info: DartLibInfo, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, json_out: bool = False, sqlite_out: bool = False):
         self.libapp_path = libapp_path
         self.dart_info = dart_info
         self.outdir = outdir
         self.rebuild_blutter = rebuild_blutter
         self.create_vs_sln = create_vs_sln
+        self.json_out = json_out
+        self.sqlite_out = sqlite_out
 
-        vers = dart_info.version.split('.', 2)
-        if int(vers[0]) == 2 and int(vers[1]) < 15:
+        # Dart <2.15 lacks metadata blutter's code analyzer depends on.
+        if version_tuple(dart_info.version) < (2, 15):
             if not no_analysis:
                 print('Dart version <2.15, force "no-analysis" option')
             no_analysis = True
@@ -48,18 +50,27 @@ class BlutterInput:
 
 
 def find_lib_files(indir: str):
-    app_file = os.path.join(indir, 'libapp.so')
-    if not os.path.isfile(app_file):
-        app_file = os.path.join(indir, 'App')
-        if not os.path.isfile(app_file):
-            sys.exit("Cannot find libapp file")
-    
-    flutter_file = os.path.join(indir, 'libflutter.so')
-    if not os.path.isfile(flutter_file):
-        flutter_file = os.path.join(indir, 'Flutter')
-        if not os.path.isfile(flutter_file):
-            sys.exit("Cannot find libflutter file")
-    
+    # Accept Android (libapp.so), iOS flat (App), and iOS framework
+    # (App.framework/App) layouts so users can drop in either the contents
+    # of an extracted APK/IPA or a Flutter build output directly.
+    app_candidates = [
+        os.path.join(indir, 'libapp.so'),
+        os.path.join(indir, 'App.framework', 'App'),
+        os.path.join(indir, 'App'),
+    ]
+    app_file = next((p for p in app_candidates if os.path.isfile(p)), None)
+    if app_file is None:
+        sys.exit("Cannot find libapp file")
+
+    flutter_candidates = [
+        os.path.join(indir, 'libflutter.so'),
+        os.path.join(indir, 'Flutter.framework', 'Flutter'),
+        os.path.join(indir, 'Flutter'),
+    ]
+    flutter_file = next((p for p in flutter_candidates if os.path.isfile(p)), None)
+    if flutter_file is None:
+        sys.exit("Cannot find libflutter file")
+
     return os.path.abspath(app_file), os.path.abspath(flutter_file)
 
 def extract_libs_from_apk(apk_file: str, out_dir: str):
@@ -75,6 +86,41 @@ def extract_libs_from_apk(apk_file: str, out_dir: str):
 
         app_file = os.path.join(out_dir, app_info.filename)
         flutter_file = os.path.join(out_dir, flutter_info.filename)
+        return app_file, flutter_file
+
+def extract_libs_from_ipa(ipa_file: str, out_dir: str):
+    """Extract App (Dart snapshot) and Flutter (engine) binaries from an iOS IPA.
+
+    IPA layout:
+        Payload/<Name>.app/Frameworks/App.framework/App
+        Payload/<Name>.app/Frameworks/Flutter.framework/Flutter
+    """
+    with zipfile.ZipFile(ipa_file, "r") as zf:
+        app_name = None
+        flutter_name = None
+        for name in zf.namelist():
+            # Zip entries always use forward slashes regardless of platform.
+            parts = name.split('/')
+            if (len(parts) >= 5
+                    and parts[0] == 'Payload'
+                    and parts[1].endswith('.app')
+                    and parts[2] == 'Frameworks'):
+                if parts[3] == 'App.framework' and parts[-1] == 'App' and not name.endswith('/'):
+                    app_name = name
+                elif parts[3] == 'Flutter.framework' and parts[-1] == 'Flutter' and not name.endswith('/'):
+                    flutter_name = name
+            if app_name and flutter_name:
+                break
+
+        if app_name is None or flutter_name is None:
+            sys.exit("Cannot find App.framework/App or Flutter.framework/Flutter in the IPA")
+
+        zf.extract(app_name, out_dir)
+        zf.extract(flutter_name, out_dir)
+
+        # zf.extract preserves the internal path, so join with posixpath-normalized parts.
+        app_file = os.path.join(out_dir, *app_name.split('/'))
+        flutter_file = os.path.join(out_dir, *flutter_name.split('/'))
         return app_file, flutter_file
 
 def find_compat_macro(dart_version: str, no_analysis: bool):
@@ -206,28 +252,87 @@ def build_and_run(input: BlutterInput):
             cmake_blutter(input)
             assert os.path.isfile(input.blutter_file), "Build complete but cannot find Blutter binary: " + input.blutter_file
 
-        # execute blutter    
-        subprocess.run([input.blutter_file, '-i', input.libapp_path, '-o', input.outdir], check=True)
+        # execute blutter
+        cmd = [input.blutter_file, '-i', input.libapp_path, '-o', input.outdir]
+        if input.json_out:
+            cmd.append('--json')
+        if input.sqlite_out:
+            cmd.append('--sqlite')
+        subprocess.run(cmd, check=True)
 
-def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+        # Convert the emitted SQL text to a binary SQLite database using the
+        # Python stdlib so the C++ binary doesn't need to link libsqlite3.
+        if input.sqlite_out:
+            import sqlite3
+            sql_path = os.path.join(input.outdir, 'blutter.db.sql')
+            db_path = os.path.join(input.outdir, 'blutter.db')
+            if not os.path.isfile(sql_path):
+                sys.exit(f"Expected {sql_path} to exist after blutter ran with --sqlite")
+            if os.path.exists(db_path):
+                os.remove(db_path)
+            print(f'Building SQLite database at {db_path}')
+            with open(sql_path, 'r', encoding='utf-8') as f:
+                sql_text = f.read()
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(sql_text)
+                conn.commit()
+            finally:
+                conn.close()
+
+        # Iter 7: deobfuscation pass. Only meaningful when we have either
+        # blutter.db or functions.json to read from; otherwise skip silently.
+        if input.sqlite_out or input.json_out:
+            try:
+                from scripts.deobfuscate import run as deobfuscate_run
+            except ImportError:
+                # When blutter.py is invoked via an older shim that puts the
+                # repo root in a way that breaks the package-style import,
+                # fall back to a direct file import.
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    "deobfuscate",
+                    os.path.join(SCRIPT_DIR, "scripts", "deobfuscate.py"),
+                )
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                deobfuscate_run = mod.run
+            summary = deobfuscate_run(input.outdir)
+            if summary.get("is_obfuscated"):
+                print(
+                    f"[deobfuscate] obfuscated snapshot detected "
+                    f"(ratio={summary['ratio']:.1%} of {summary['total_named_functions']} "
+                    f"functions match rename pattern)"
+                )
+            else:
+                print(
+                    f"[deobfuscate] snapshot looks non-obfuscated "
+                    f"(ratio={summary['ratio']:.1%})"
+                )
+
+def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, json_out: bool = False, sqlite_out: bool = False):
     version, os_name, arch = dart_version.split('_')
     dart_info = DartLibInfo(version, os_name, arch)
-    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
-    build_and_run(input)
-    
-def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
-    dart_info = get_dart_lib_info(libapp_path, libflutter_path)
-    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis, json_out, sqlite_out)
     build_and_run(input)
 
-def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, json_out: bool = False, sqlite_out: bool = False):
+    dart_info = get_dart_lib_info(libapp_path, libflutter_path)
+    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis, json_out, sqlite_out)
+    build_and_run(input)
+
+def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, json_out: bool = False, sqlite_out: bool = False):
     if indir.endswith(".apk"):
         with tempfile.TemporaryDirectory() as tmp_dir:
             libapp_file, libflutter_file = extract_libs_from_apk(indir, tmp_dir)
-            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, json_out, sqlite_out)
+    elif indir.endswith(".ipa"):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            libapp_file, libflutter_file = extract_libs_from_ipa(indir, tmp_dir)
+            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, json_out, sqlite_out)
     else:
         libapp_file, libflutter_file = find_lib_files(indir)
-        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, json_out, sqlite_out)
 
 
 if __name__ == "__main__":
@@ -240,11 +345,13 @@ if __name__ == "__main__":
     parser.add_argument('--rebuild', action='store_true', default=False, help='Force rebuild the Blutter executable')
     parser.add_argument('--vs-sln', action='store_true', default=False, help='Generate Visual Studio solution at <outdir>')
     parser.add_argument('--no-analysis', action='store_true', default=False, help='Do not build with code analysis')
+    parser.add_argument('--json', action='store_true', default=False, help='Also emit pp.json and objs.json (schema_version 1)')
+    parser.add_argument('--sqlite', action='store_true', default=False, help='Also emit blutter.db (objects/pool/functions tables)')
     # rare usage scenario
     parser.add_argument('--dart-version', help='Run without libflutter (indir become libapp.so) by specify dart version such as "3.4.2_android_arm64"')
     args = parser.parse_args()
 
     if args.dart_version is None:
-        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
+        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.json, args.sqlite)
     else:
-        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
+        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.json, args.sqlite)

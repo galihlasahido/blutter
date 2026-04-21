@@ -32,6 +32,26 @@ def load_source(modname, filename):
     return module
 """
 
+
+def version_tuple(version):
+    """Parse a Dart version string into a tuple of integers for ordered comparison.
+
+    Accepts pure dotted forms ("3.8.0"), two-component forms ("3.8"), and
+    pre-release tags ("3.8.0-226.0.dev"). Non-numeric suffixes on a component
+    are stripped so '0-226' parses as 0.
+    """
+    parts = []
+    for part in version.split('.'):
+        digits = ''
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits:
+            parts.append(int(digits))
+    return tuple(parts)
+
 class DartLibInfo:
     def __init__(self, version: str, os_name: str, arch: str, has_compressed_ptrs = None, snapshot_hash = None):
         self.version = version
@@ -57,7 +77,14 @@ def checkout_dart(info: DartLibInfo):
         def remove_readonly(func, path, _):
             os.chmod(path, stat.S_IWRITE)
             func(path)
-        shutil.rmtree(clonedir, onerror=remove_readonly)
+        # Python 3.12 deprecated `onerror` in favor of `onexc`; 3.14 removes it.
+        if sys.version_info[:2] >= (3, 12):
+            def on_exc(func, path, exc):
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            shutil.rmtree(clonedir, onexc=on_exc)
+        else:
+            shutil.rmtree(clonedir, onerror=remove_readonly)
     
     # clone Dart source code
     if not os.path.exists(clonedir):
@@ -103,19 +130,22 @@ def checkout_dart(info: DartLibInfo):
         if sys.platform == 'win32':
             # since Dart 3.8, RUNTIME_FUNCTION is declared when DART_HOST_OS_WINDOWS and TARGET_ARCH_ARM64 are set
             # patch "runtime/platform/unwinding_records.h" to remove the declaration
-            vers = info.version.split('.', 2)
-            if int(vers[0]) >= 3 and int(vers[1]) >= 8:
+            if version_tuple(info.version) >= (3, 8):
                 with open(os.path.join(clonedir, 'runtime', 'platform', 'unwinding_records.h'), 'r+b') as f:
                     mm = mmap.mmap(f.fileno(), 0)
-                    pos = mm.find(b'\n#if !defined(DART_HOST_OS_WINDOWS) || !defined(HOST_ARCH_ARM64)')
-                    if pos != -1:
-                        # replace "||" with "//" to comment out "!defined(HOST_ARCH_ARM64)"
-                        mm[pos+36:pos+38] = b'//'
-                    else:
-                        # newer Dart version use static_assert for checking RUNTIME_FUNCTION size, comment out that line
-                        pos = mm.find(b'\nstatic_assert(sizeof(')
+                    try:
+                        pos = mm.find(b'\n#if !defined(DART_HOST_OS_WINDOWS) || !defined(HOST_ARCH_ARM64)')
                         if pos != -1:
-                            mm[pos+1:pos+3] = b'//'
+                            # replace "||" with "//" to comment out "!defined(HOST_ARCH_ARM64)"
+                            mm[pos+36:pos+38] = b'//'
+                        else:
+                            # newer Dart version use static_assert for checking RUNTIME_FUNCTION size, comment out that line
+                            pos = mm.find(b'\nstatic_assert(sizeof(')
+                            if pos != -1:
+                                mm[pos+1:pos+3] = b'//'
+                        mm.flush()
+                    finally:
+                        mm.close()
     
     return clonedir
 

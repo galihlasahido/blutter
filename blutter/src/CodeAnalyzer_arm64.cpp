@@ -48,6 +48,21 @@ public:
 	if (!(cond)) throw InsnException(#cond, insn); \
   } while (false)
 
+// Patterns for scaling a tagged Smi value to a byte offset.
+//   - Stack slot: byte_offset = count * kWordSize; since Smi is `value<<1` and kWordSize
+//     is 8 on arm64 regardless of pointer compression, the shift magnitude is always 2.
+//     In compressed mode the Smi lives in a W-register, so the add uses `sxtw #2`; in
+//     uncompressed mode the Smi is a full 64-bit value, so a plain `lsl #2` is used.
+//   - Compressed-word element (e.g. ArgsDesc entry): byte_offset = idx * kCompressedWordSize.
+//     Compressed (entry=4B): `sxtw #1`. Uncompressed (entry=8B): `lsl #2`.
+#if defined(DART_COMPRESSED_POINTERS)
+#define INSN_SMI_STACK_SCALE(op) ((op).ext == ARM64_EXT_SXTW && (op).shift.value == 2)
+#define INSN_SMI_PAIR_SCALE(op)  ((op).ext == ARM64_EXT_SXTW && (op).shift.value == 1)
+#else
+#define INSN_SMI_STACK_SCALE(op) ((op).shift.type == ARM64_SFT_LSL && (op).shift.value == 2)
+#define INSN_SMI_PAIR_SCALE(op)  ((op).shift.type == ARM64_SFT_LSL && (op).shift.value == 2)
+#endif
+
 static VarValue* getPoolObject(DartApp& app, intptr_t offset, A64::Register dstReg)
 {
 	intptr_t idx = dart::ObjectPool::IndexFromOffset(offset);
@@ -182,18 +197,28 @@ static VarValue* getPoolObject(DartApp& app, intptr_t offset, A64::Register dstR
 	}
 }
 
-static inline void handleDecompressPointer(AsmIterator& insn, arm64_reg reg) {
+static inline void handleDecompressPointer(AsmIterator& insn, [[maybe_unused]] arm64_reg reg) {
+#if defined(DART_COMPRESSED_POINTERS)
 	INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 	INSN_ASSERT(insn.ops(0).reg == insn.ops(1).reg && insn.ops(0).reg == reg);
 	INSN_ASSERT(insn.ops(2).reg == CSREG_DART_HEAP && insn.ops(2).shift.value == 32);
 	++insn;
+#else
+	// Uncompressed pointers: the Dart compiler doesn't emit the ADD-with-LSR-32
+	// decompression pattern, so there's nothing to advance past.
+	(void)insn;
+#endif
 }
 
-static inline void handleExtraDecompressPointer(AsmIterator& insn, arm64_reg reg) {
+static inline void handleExtraDecompressPointer(AsmIterator& insn, [[maybe_unused]] arm64_reg reg) {
+#if defined(DART_COMPRESSED_POINTERS)
 	if (insn.id() != ARM64_INS_ADD) return;
 	if (!(insn.ops(0).reg == insn.ops(1).reg && insn.ops(0).reg == reg)) return;
 	if (!(insn.ops(2).reg == CSREG_DART_HEAP && insn.ops(2).shift.value == 32)) return;
 	++insn;
+#else
+	(void)insn;
+#endif
 }
 
 struct ILResult {
@@ -885,7 +910,7 @@ void FunctionAnalyzer::handleFixedParameters(AsmIterator& insn, arm64_reg paramC
 			break;
 		INSN_ASSERT(insn.ops(1).reg == CSREG_DART_FP);
 		// shift only 2 because the number of parameter is Smi (tagged)
-		INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == paramCntReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+		INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == paramCntReg && INSN_SMI_STACK_SCALE(insn.ops(2)));
 		const auto tmpReg = insn.ops(0).reg;
 		++insn;
 
@@ -957,7 +982,7 @@ void FunctionAnalyzer::handleOptionalPositionalParameters(AsmIterator& insn, arm
 		// parameter might not be used and no loading value
 		if (insn.id() == ARM64_INS_ADD && insn.ops(1).reg == CSREG_DART_FP) {
 			// shift only 2 because the number of parameter is Smi (tagged)
-			INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == optionalParamCntReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+			INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == optionalParamCntReg && INSN_SMI_STACK_SCALE(insn.ops(2)));
 			const auto tmpReg = insn.ops(0).reg;
 			++insn;
 
@@ -1099,12 +1124,22 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 
 				INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 				INSN_ASSERT(fnInfo->State()->GetValue(insn.ops(1).reg) == fnInfo->Vars()->ValArgsDesc());
-				INSN_ASSERT(insn.ops(2).reg == tmpReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 1);
+				INSN_ASSERT(insn.ops(2).reg == tmpReg && INSN_SMI_PAIR_SCALE(insn.ops(2)));
 				const auto tmpReg2 = insn.ops(0).reg;
 				++insn;
 
 				INSN_ASSERT(insn.id() == ARM64_INS_LDUR);
-				INSN_ASSERT(insn.ops(1).mem.base == tmpReg2 && insn.ops(1).mem.disp == sizeof(void*) * 2 - dart::kHeapObjectTag);
+				// Offset between the address computed by the preceding ADD and the actual
+				// field being loaded. See the comment above the ADD sequence: in compressed
+				// mode the ADD lands two target-words before the field (disp = 2*8 - tag),
+				// in uncompressed mode three (disp = 3*8 - tag). The size doubling is already
+				// absorbed by the `lsl #2` shift so the remaining gap still uses 8-byte units.
+#if defined(DART_COMPRESSED_POINTERS)
+				const int64_t expected_named_load_disp = (int64_t)sizeof(void*) * 2 - dart::kHeapObjectTag;
+#else
+				const int64_t expected_named_load_disp = (int64_t)sizeof(void*) * 3 - dart::kHeapObjectTag;
+#endif
+				INSN_ASSERT(insn.ops(1).mem.base == tmpReg2 && insn.ops(1).mem.disp == expected_named_load_disp);
 				const auto dstReg = ToCapstoneReg(insn.ops(0).reg);
 				++insn;
 
@@ -1302,7 +1337,7 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 
 			INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 			INSN_ASSERT(insn.ops(1).reg == CSREG_DART_FP);
-			INSN_ASSERT(insn.ops(2).reg == tmpReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+			INSN_ASSERT(insn.ops(2).reg == tmpReg && INSN_SMI_STACK_SCALE(insn.ops(2)));
 			const auto tmpReg2 = insn.ops(0).reg;
 			++insn;
 
@@ -1355,10 +1390,17 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 		if (!isRequired) {
 			// Smi to native. only non first and last name do it
 			if (nameParamCnt && !isLastName) {
-				// 0x412924: sbfx  x5, x2, #1, #0x1f
+				// compressed:   sbfx  x5, x2, #1, #0x1f   (32-bit Smi)
+				// uncompressed: asr   x5, x2, #1          (64-bit Smi)
 				if (insn.id() == ARM64_INS_SBFX) {
 					INSN_ASSERT(fnInfo->State()->GetValue(insn.ops(1).reg) == &valNameCurrParamPosSmi);
 					INSN_ASSERT(insn.ops(2).imm == 1 && insn.ops(3).imm == 0x1f);
+					fnInfo->State()->SetRegister(insn.ops(0).reg, fnInfo->Vars()->ValCurrNumNameParam());
+					++insn;
+				}
+				else if (insn.id() == ARM64_INS_ASR) {
+					INSN_ASSERT(fnInfo->State()->GetValue(insn.ops(1).reg) == &valNameCurrParamPosSmi);
+					INSN_ASSERT(insn.ops(2).imm == 1);
 					fnInfo->State()->SetRegister(insn.ops(0).reg, fnInfo->Vars()->ValCurrNumNameParam());
 					++insn;
 				}
@@ -1407,7 +1449,11 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 
 			// TODO: split state for match and mismatch branch, so all param can be tracked correctly
 			if (insn.id() == ARM64_INS_SBFX && insn.ops(2).imm == 1 && insn.ops(3).imm == 0x1f) {
-				// assume curr param pos Smi to native in default branch
+				// compressed: assume curr param pos Smi to native in default branch
+				++insn;
+			}
+			else if (insn.id() == ARM64_INS_ASR && insn.ops(2).imm == 1) {
+				// uncompressed: same role as the SBFX above
 				++insn;
 			}
 
@@ -1546,7 +1592,7 @@ void FunctionAnalyzer::handleArgumentsDescriptorTypeArguments(AsmIterator& insn)
 
 	INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 	INSN_ASSERT(insn.ops(1).reg == CSREG_DART_FP);
-	INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == sizeReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+	INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == sizeReg && INSN_SMI_STACK_SCALE(insn.ops(2)));
 	const auto tmpReg = insn.ops(0).reg;
 	fnInfo->State()->ClearRegister(tmpReg);
 	++insn;
@@ -3303,7 +3349,10 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 				INSN_ASSERT(shift.value == idxShiftVal);
 			}
 			bool isTypedData = dart::UntaggedTypedData::payload_offset() - dart::kHeapObjectTag == arr_data_offset;
-			INSN_ASSERT(isTypedData || arr_data_offset == dart::Array::data_offset() - dart::kHeapObjectTag);
+			bool isOneByteString = dart::OneByteString::data_offset() - dart::kHeapObjectTag == arr_data_offset;
+			bool isTwoByteString = dart::TwoByteString::data_offset() - dart::kHeapObjectTag == arr_data_offset;
+			INSN_ASSERT(isTypedData || isOneByteString || isTwoByteString ||
+				arr_data_offset == dart::Array::data_offset() - dart::kHeapObjectTag);
 			const auto op0Reg = A64::Register{ insn.ops(0).reg };
 			++insn;
 			if (arrayOp.isLoad) {
@@ -3422,7 +3471,9 @@ AsmTexts CodeAnalyzer::convertAsm(AsmInstructions& asm_insns)
 		text_asm.dataType = AsmText::None;
 		
 		memset(text_asm.text, ' ', 16);
-		memcpy(text_asm.text, insn->mnemonic, strlen(insn->mnemonic));
+		// Reserve byte 15 for the space separator so a long mnemonic can't spill into the operand region.
+		const size_t mnem_len = std::min<size_t>(strlen(insn->mnemonic), 15);
+		memcpy(text_asm.text, insn->mnemonic, mnem_len);
 		auto ptr = text_asm.text + 16;
 		auto op_ptr = insn->op_str;
 		bool token_start = true;

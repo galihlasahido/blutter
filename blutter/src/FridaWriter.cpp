@@ -3,6 +3,10 @@
 #include <fstream>
 #include <filesystem>
 #include "Util.h"
+#include "DartClass.h"
+#include "DartFunction.h"
+#include "DartLibrary.h"
+#include "DartTypes.h"
 
 #ifndef FRIDA_TEMPLATE_DIR
 #define FRIDA_TEMPLATE_DIR "scripts"
@@ -154,6 +158,57 @@ void FridaWriter::Create(const char* filename)
 			of << "argOffset:" << dartCls->TypeArgumentOffset();// << ",";
 			of << "},\n";
 		}
+	}
+	of << "];\n";
+
+	// Function metadata table. Emits one entry per analyzed DartFunction keyed
+	// by entry-point offset within libapp/App. Consumed by findFunctionByAddr
+	// / findFunctionByName / hookFunction helpers in frida.template.js.
+	//
+	// Kept compact on purpose: short keys (addr/name/cls/lib/argc/argcOpt/
+	// ret/stat/clos/named) and only-emit-if-set flags, so the table doesn't
+	// balloon the rendered script for apps with tens of thousands of functions.
+	of << "const Functions = [\n";
+	for (const auto& [addr, dartFn] : app.functions) {
+		if (!dartFn) continue;
+		of << "{";
+		of << "addr:" << addr << ",";
+		of << "name:" << Util::Quote(dartFn->Name()) << ",";
+		of << "cls:" << Util::Quote(dartFn->Class().Name()) << ",";
+		of << "lib:" << Util::Quote(dartFn->Class().Library().url) << ",";
+		of << "argc:" << dartFn->NumParam();
+		if (dartFn->NumOptionalParam() > 0)
+			of << ",argcOpt:" << dartFn->NumOptionalParam();
+		if (dartFn->HasNamedParam())
+			of << ",named:1";
+		if (dartFn->IsStatic())
+			of << ",stat:1";
+		if (dartFn->IsClosure())
+			of << ",clos:1";
+		const auto retType = dartFn->Signature().ReturnType();
+		if (retType != nullptr)
+			of << ",ret:" << Util::Quote(retType->ToString());
+		// Parameter vector (Iter 6). Emitted only when the signature had any
+		// parameters recovered so the table stays small for apps whose
+		// signatures were stripped at compile time.
+		auto& params = dartFn->Signature().params;
+		if (!params.empty()) {
+			of << ",params:[";
+			bool firstP = true;
+			for (auto& p : params) {
+				if (!firstP) of << ",";
+				firstP = false;
+				of << "{";
+				if (!p.name.empty())
+					of << "name:" << Util::Quote(p.name) << ",";
+				of << "type:" << Util::Quote(p.type ? p.type->ToString() : std::string(""));
+				if (p.isRequired)
+					of << ",req:1";
+				of << "}";
+			}
+			of << "]";
+		}
+		of << "},\n";
 	}
 	of << "];\n";
 }

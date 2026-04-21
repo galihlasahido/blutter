@@ -26,10 +26,14 @@ if os.path.exists(CAPSTONE_DIR):
 
 # icu
 print('Downloading ICU library from ' + ICU_LIB_URL)
-r = requests.get(ICU_LIB_URL)
+r = requests.get(ICU_LIB_URL, timeout=60)
 print('Extracting ICU library')
 with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-    with z.open(z.namelist()[-1]) as zf, open(ICU_WINDOWS_FILE, 'wb') as f:
+    # pick the inner binaries zip by name rather than by list position
+    inner = next((n for n in z.namelist() if n.lower().endswith('.zip')), None)
+    if inner is None:
+        raise RuntimeError('No inner zip found in ICU release archive')
+    with z.open(inner) as zf, open(ICU_WINDOWS_FILE, 'wb') as f:
         shutil.copyfileobj(zf, f)
 
 with zipfile.ZipFile(ICU_WINDOWS_FILE) as z:
@@ -38,7 +42,7 @@ os.remove(ICU_WINDOWS_FILE)
 
 # capstone
 print('Downloading Capstone from ' + CAPSTONE_LIB_URL)
-r = requests.get(CAPSTONE_LIB_URL)
+r = requests.get(CAPSTONE_LIB_URL, timeout=60)
 print('Extracting Capstone library')
 with zipfile.ZipFile(io.BytesIO(r.content)) as z:
     capstone_zip_dir = z.namelist()[0].split('/', 1)[0]

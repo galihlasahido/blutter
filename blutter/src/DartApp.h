@@ -83,5 +83,6 @@ private:
 	friend class DartAnalyzer;
 	friend class DartDumper;
 	friend class FridaWriter;
+	friend class DwarfWriter;
 };
 

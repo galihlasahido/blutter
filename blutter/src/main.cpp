@@ -3,6 +3,7 @@
 #include "DartDumper.h"
 #include "CodeAnalyzer.h"
 #include "FridaWriter.h"
+#include "DwarfWriter.h"
 #include "args.hxx"
 #include <filesystem>
 
@@ -13,6 +14,8 @@ int main(int argc, char** argv)
 	args::Group reqGrp(parser, "Required arguments", args::Group::Validators::All);
 	args::ValueFlag<std::string> infile(reqGrp, "infile", "libapp file", { 'i', "in" });
 	args::ValueFlag<std::string> outdir(reqGrp, "outdir", "out path", { 'o', "out"});
+	args::Flag jsonOut(parser, "json", "Also emit pp.json and objs.json (schema_version 1)", { "json" });
+	args::Flag sqliteOut(parser, "sqlite", "Also emit blutter.db.sql (objects/pool/functions; blutter.py converts to blutter.db)", { "sqlite" });
 
 	try {
 		parser.ParseCLI(argc, argv);
@@ -45,6 +48,16 @@ int main(int argc, char** argv)
 		std::cout << "Dumping Object Pool\n";
 		dumper.DumpObjectPool((outDir / "pp.txt").string().c_str());
 		dumper.DumpObjects((outDir / "objs.txt").string().c_str());
+		if (jsonOut) {
+			std::cout << "Writing JSON exports (schema_version 1)\n";
+			dumper.DumpObjectPoolJson((outDir / "pp.json").string().c_str());
+			dumper.DumpObjectsJson((outDir / "objs.json").string().c_str());
+			dumper.DumpFunctionsJson((outDir / "functions.json").string().c_str());
+		}
+		if (sqliteOut) {
+			std::cout << "Writing SQLite SQL export (blutter.db.sql)\n";
+			dumper.DumpSqlite((outDir / "blutter.db.sql").string().c_str());
+		}
 #ifndef NO_CODE_ANALYSIS
 		std::cout << "Generating application assemblies\n";
 #else
@@ -52,10 +65,15 @@ int main(int argc, char** argv)
 #endif
 		dumper.DumpCode((outDir / "asm").string().c_str());
 		dumper.Dump4Ida(outDir / "ida_script");
+		dumper.Dump4Ghidra(outDir / "ghidra_script");
 
 		std::cout << "Generating Frida script\n";
 		FridaWriter fwriter{ app };
 		fwriter.Create((outDir / "blutter_frida.js").string().c_str());
+
+		std::cout << "Generating DWARF symbol file\n";
+		DwarfWriter dwriter{ app };
+		dwriter.Create((outDir / "blutter.dwarf").string().c_str());
 
 		app.ExitScope();
 	}

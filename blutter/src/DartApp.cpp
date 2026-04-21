@@ -1,7 +1,15 @@
 #include "pch.h"
 #include "DartApp.h"
 #include "ElfHelper.h"
+#include "MachOHelper.h"
 #include "DartLoader.h"
+#include <cstdio>
+#include <fcntl.h>
+#if defined(_WIN32) || defined(WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 PRAGMA_WARNING(push, 0)
 #include <vm/stub_code.h>
 #include <vm/heap/safepoint.h>
@@ -9,9 +17,46 @@ PRAGMA_WARNING(pop)
 #include <format>
 #include <iostream> // for debugging purpose
 
+namespace {
+
+// Read the first 4 bytes of `path` so we can dispatch between ELF and Mach-O
+// without double-mapping the file.
+bool read_magic(const char* path, uint8_t magic[4])
+{
+	FILE* f = std::fopen(path, "rb");
+	if (f == nullptr) return false;
+	size_t got = std::fread(magic, 1, 4, f);
+	std::fclose(f);
+	return got == 4;
+}
+
+LibAppInfo map_lib_auto(const char* path)
+{
+	uint8_t magic[4] = { 0 };
+	if (!read_magic(path, magic))
+		throw std::invalid_argument("Cannot read libapp header");
+
+	// Mach-O thin 64-bit LE (feedfacf) or FAT containers (cafebabe / cafebabf,
+	// big-endian on disk so the bytes appear as 0xCA 0xFE 0xBA 0xBE).
+	const bool is_macho_thin =
+		magic[0] == 0xcf && magic[1] == 0xfa && magic[2] == 0xed && magic[3] == 0xfe;
+	const bool is_macho_fat =
+		magic[0] == 0xca && magic[1] == 0xfe && magic[2] == 0xba &&
+		(magic[3] == 0xbe || magic[3] == 0xbf);
+
+	if (is_macho_thin || is_macho_fat) {
+		return MachOHelper::MapLibApp(path);
+	}
+	// Fall through to ELF; ElfHelper will raise a descriptive error if the
+	// magic doesn't actually match.
+	return ElfHelper::MapLibAppSo(path);
+}
+
+} // namespace
+
 DartApp::DartApp(const char* path) : ppool(NULL), nativeLib(0xdeadead), throwStubAddr(0)
 {
-	auto libInfo = ElfHelper::MapLibAppSo(path);
+	auto libInfo = map_lib_auto(path);
 	lib_base = libInfo.lib;
 	vm_snapshot_data = libInfo.vm_snapshot_data;
 	vm_snapshot_instructions = libInfo.vm_snapshot_instructions;
@@ -600,6 +645,8 @@ void DartApp::finalizeFunctionsInfo()
 			const intptr_t num_opt_pos_params = sig.NumOptionalPositionalParameters();
 			const intptr_t num_opt_named_params = sig.NumOptionalNamedParameters();
 			const intptr_t num_opt_params = num_opt_pos_params + num_opt_named_params;
+			dartFn->Signature().numOptionalParam = static_cast<int>(num_opt_params);
+			dartFn->Signature().hasNamedParam = num_opt_named_params > 0;
 
 			auto& dname = dart::String::Handle();
 			for (intptr_t i = 0; i < num_params; i++) {

@@ -29,8 +29,12 @@ set(SRCS
     Disassembler_arm64.h
     ElfHelper.cpp
     ElfHelper.h
+    MachOHelper.cpp
+    MachOHelper.h
     FridaWriter.cpp
     FridaWriter.h
+    DwarfWriter.cpp
+    DwarfWriter.h
     HtArrayIterator.h
     Util.cpp
     Util.h

@@ -81,9 +81,11 @@ constexpr arm64_reg CSREG_DART_WB_VALUE = ToCapstoneReg(dart::kWriteBarrierValue
 constexpr arm64_reg CSREG_DART_WB_SLOT = ToCapstoneReg(dart::kWriteBarrierSlotReg);
 constexpr arm64_reg CSREG_DART_THR = ToCapstoneReg(dart::THR);
 constexpr arm64_reg CSREG_DART_PP = ToCapstoneReg(dart::PP);
-#if defined(DART_COMPRESSED_POINTERS)
+// dart::HEAP_BITS (R28) is defined regardless of pointer compression.
+// Compressed: holds (write_barrier_mask << 32) | (heap_base >> 32) and drives
+// the ADD-with-LSR-32 decompression pattern. Uncompressed: holds the write
+// barrier mask only. Either way the register exists, so the constant is too.
 constexpr arm64_reg CSREG_DART_HEAP = ToCapstoneReg(dart::HEAP_BITS);
-#endif
 constexpr arm64_reg CSREG_DART_TMP = ToCapstoneReg(dart::TMP);
 constexpr arm64_reg CSREG_DART_TMP2 = ToCapstoneReg(dart::TMP2);
 // Note: kTagReg is normally in wrapper function. can ignore it.

@@ -54,13 +54,16 @@ set_target_properties(${LIBNAME} PROPERTIES
 	VISIBILITY_INLINES_HIDDEN ON
 	POSITION_INDEPENDENT_CODE ON)
 
-# DART_TARGET_OS_ANDROID or DART_TARGET_OS_MACOS_IOS
+# DART_TARGET_OS_ANDROID or DART_TARGET_OS_MACOS(_IOS).
+# For iOS the Dart SDK expects BOTH DART_TARGET_OS_MACOS and DART_TARGET_OS_MACOS_IOS
+# so the various `#if defined(DART_TARGET_OS_MACOS) / #if defined(...MACOS_IOS)`
+# nested checks in runtime/vm/dart.cc etc. match.
 if (${TARGET_OS} STREQUAL "android")
 	set(target_os "DART_TARGET_OS_ANDROID")
 	# Note: DART_COMPRESSED_POINTERS should be from the binary
 	#set(dart_pointers "DART_COMPRESSED_POINTERS")
 else()
-	set(target_os "DART_TARGET_OS_MACOS_IOS")
+	set(target_os "DART_TARGET_OS_MACOS;DART_TARGET_OS_MACOS_IOS")
 endif()
 # TARGET_ARCH_ARM64 or TARGET_ARCH_X64
 if (${TARGET_ARCH} STREQUAL "arm64")

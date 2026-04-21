@@ -258,6 +258,60 @@ function getArg(context, idx) {
     return stack.add(8 * idx).readPointer();
 }
 
+// --- Function lookup ---------------------------------------------------------
+// The `Functions` table is appended below by FridaWriter::Create. Each entry is
+// { addr, name, cls, lib, argc, argcOpt?, named?, stat?, clos?, ret? } where
+// addr is the entry-point offset within libapp's base.
+
+let _fnByAddr = null;
+let _fnByQName = null;
+
+function _buildFunctionIndexes() {
+    if (_fnByAddr !== null)
+        return;
+    _fnByAddr = new Map();
+    _fnByQName = new Map();
+    for (const f of Functions) {
+        _fnByAddr.set(f.addr, f);
+        // Index under three progressively more qualified keys. Collisions on
+        // bare name are expected (e.g. two classes both have `build`); the
+        // more-qualified keys disambiguate. Last write wins on the bare key,
+        // which is fine because bare-name callers are expected to also try
+        // the qualified form when the result looks wrong.
+        _fnByQName.set(f.name, f);
+        _fnByQName.set(`${f.cls}.${f.name}`, f);
+        _fnByQName.set(`[${f.lib}] ${f.cls}::${f.name}`, f);
+    }
+}
+
+function getFunctionByAddr(offset) {
+    _buildFunctionIndexes();
+    return _fnByAddr.get(offset) || null;
+}
+
+function getFunctionByName(name) {
+    _buildFunctionIndexes();
+    return _fnByQName.get(name) || null;
+}
+
+// Convenience wrapper: Interceptor.attach wired by name or offset, with the
+// function's metadata logged once at hook time so you can verify you got the
+// right overload.
+function hookFunction(nameOrAddr, callbacks) {
+    const f = (typeof nameOrAddr === 'number')
+        ? getFunctionByAddr(nameOrAddr)
+        : getFunctionByName(nameOrAddr);
+    if (!f) {
+        console.error(`hookFunction: not found: ${nameOrAddr}`);
+        return null;
+    }
+    const sig = `${f.ret || 'dynamic'} ${f.cls}.${f.name}/${f.argc}` +
+        (f.argcOpt ? `+${f.argcOpt}${f.named ? '{}' : '[]'}` : '') +
+        (f.stat ? ' static' : '') + (f.clos ? ' closure' : '');
+    console.log(`hookFunction: ${sig} @ +0x${f.addr.toString(16)}`);
+    return Interceptor.attach(libapp.add(f.addr), callbacks);
+}
+
 function isHeapObject(ptr) {
     return (ptr.toInt32() & 1) == 1;
 }

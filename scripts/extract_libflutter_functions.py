@@ -11,13 +11,13 @@ def extract_libflutter_functions(libflutter_file):
         rodata = section.data()
         rohdr = section.header
         
-        gerVersion_text_offset = rohdr.sh_addr + rodata.index(b'\x00Platform_GetVersion\x00') + 1
-        print(f'Platform_GetVersion text offset: {gerVersion_text_offset:#x}')
-        gerVersion_text_offset = pack('<Q', gerVersion_text_offset)
+        getVersion_text_offset = rohdr.sh_addr + rodata.index(b'\x00Platform_GetVersion\x00') + 1
+        print(f'Platform_GetVersion text offset: {getVersion_text_offset:#x}')
+        getVersion_text_offset = pack('<Q', getVersion_text_offset)
         
         section = elf.get_section_by_name('.rela.dyn')
         rela_data = section.data()
-        rela_entry_offset = rela_data.index(gerVersion_text_offset) - 16
+        rela_entry_offset = rela_data.index(getVersion_text_offset) - 16
         assert rela_entry_offset % 24 == 0, rela_entry_offset
         print(f'Platform_GetVersion text rela offset: {section.header.sh_addr+rela_entry_offset:#x}')
         
@@ -60,22 +60,49 @@ def extract_libflutter_functions(libflutter_file):
         # get version
         fn_addr = io_natives['Platform_GetVersion']
         print(f'Platform_GetVersion: {fn_addr:#x}')
-        getVersion_code = readCode(fn_addr, 40)
+        getVersion_code = readCode(fn_addr, 0x80)
         code = list(md.disasm_lite(getVersion_code, fn_addr))
-        assert code[0][2] == 'stp', code[0]
-        assert code[1][2] == 'mov'
-        assert code[2][2] == 'adrp', code[2]
-        dart_version_addr = int(code[2][3][5:], 0)
-        assert code[3][2] == 'add' and code[3][3].startswith('x0, x0, #'), code[3]
-        dart_version_addr += int(code[3][3][9:], 0)
+
+        # Pattern-match the instructions we care about instead of hard-coding
+        # indices. A different prologue (e.g. `paciasp` with pointer-auth or
+        # an inlined save/restore pair) will shift every index but leaves the
+        # pattern intact. We look for:
+        #   * ADRP x0, <page> ; ADD x0, x0, #<lo>  → dart_version string address
+        #   * First BL                              → Dart_NewStringFromCString
+        #   * First tail-branch B (after the BL)    → Dart_SetReturnValue
+        dart_version_addr = None
+        new_string_bl = None
+        set_return_b = None
+        saw_bl = False
+        for i, (_, _, mnemonic, op_str) in enumerate(code):
+            if dart_version_addr is None and mnemonic == 'adrp' and op_str.startswith('x0,'):
+                # ADRP operand format: "x0, #0xNNNN" — the "#" is optional on some
+                # Capstone builds but the trailing integer is always the last token.
+                page = int(op_str.rsplit(' ', 1)[-1].lstrip('#'), 0)
+                # ADD x0, x0, #<lo> is typically the immediate successor; scan a
+                # short window to tolerate scheduler reorder.
+                for j in range(i + 1, min(i + 4, len(code))):
+                    if code[j][2] == 'add' and code[j][3].startswith('x0, x0, #'):
+                        lo = int(code[j][3][len('x0, x0, #'):], 0)
+                        dart_version_addr = page + lo
+                        break
+            elif not saw_bl and mnemonic == 'bl':
+                new_string_bl = int(op_str.lstrip('#'), 0)
+                saw_bl = True
+            elif saw_bl and mnemonic == 'b':
+                set_return_b = int(op_str.lstrip('#'), 0)
+                break
+
+        assert dart_version_addr is not None, \
+            'Could not locate ADRP+ADD for dart_version string in Platform_GetVersion'
+        assert new_string_bl is not None, \
+            'Could not locate BL Dart_NewStringFromCString in Platform_GetVersion'
+        assert set_return_b is not None, \
+            'Could not locate tail B Dart_SetReturnValue in Platform_GetVersion'
+
         dart_version = getRefString(dart_version_addr)
-        assert code[4][2] == 'bl', code[4]
-        dart_fns['Dart_NewStringFromCString'] = int(code[4][3][1:], 0)
-        assert code[5][2] == 'mov', code[5]
-        assert code[6][2] == 'mov', code[6]
-        assert code[7][2] == 'ldp', code[7]
-        assert code[8][2] == 'b', code[8]
-        dart_fns['Dart_SetReturnValue'] = int(code[8][3][1:], 0)
+        dart_fns['Dart_NewStringFromCString'] = new_string_bl
+        dart_fns['Dart_SetReturnValue'] = set_return_b
         
         
         fn_addr = io_natives['Stdout_GetTerminalSize']
